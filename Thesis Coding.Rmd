@@ -1,0 +1,927 @@
+---
+title: "Senior Thesis"
+author: "David Song"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(mem)
+library(npreg)
+library(gridExtra)
+library(seqinr)
+library(ape)
+library(msa)
+library(treeio)
+library(ggtree)
+library(gt)
+library(tsibble)
+library(tidyverse)
+library(ggcorrplot)
+```
+
+```{r Epiweek to Date Conversion}
+# function takes the year and epiweek # and converts it to a lubridate date
+epiweek_to_date <- function(y, w) {
+  date <- ymd(paste(y, "/01/01", sep = ""))
+  
+  # finds which weekday the year starts on
+  wday <- wday(date)
+  
+  # if M, T, W, or Th, starts epiweek on the first Saturday and adds days equivalent to epiweek #
+  case_when(
+  wday <= 4 ~ date + days(7 - wday) + weeks(w - 1),
+  
+  # if F, S, or Su, starts epiweek on the second Saturday
+  wday > 4 ~ date + days(14 - wday) + weeks(w - 1)
+  )
+}
+```
+
+```{r}
+tscore <- function(data) {
+  num <- data %>% unlist() %>% as.numeric()
+  t <- c()
+  mean <- mean(data %>% unlist())
+  sd <- sd(data %>% unlist())
+  for (i in 1:12) {
+    t[[i]] <- (num[[i]] - mean) / (sd / sqrt(12))
+  }
+  return(t)
+}
+```
+
+---------------------------------------------------------------------------------------------------------------------------------
+Cleaning and Reading Infection Rate Data
+---------------------------------------------------------------------------------------------------------------------------------
+
+```{r Reading in data dumps}
+# data after 2016 is separated into clinical and public health labs
+clinical_post2016 <- read.csv("FluViewData/WHO_NREVSS_Clinical_Labs.csv")
+public_health_post2016 <- read.csv("FluViewData/WHO_NREVSS_Public_Health_Labs.csv")
+combined_pre2016 <- read.csv("FluViewData/WHO_NREVSS_Combined_prior_to_2015_16.csv")
+hospitalization <- read.csv("FluViewData/FluSurveillance_Custom_Download_Data.csv")
+hos_percent <- read.csv("FluViewData/Weekly_Data_Percent_by_Virus.csv")
+```
+
+```{r Cleaning pre 2016 data}
+# generate metrics and removing unnecessary columns in pre-2016 data
+combined_pre2016 <- combined_pre2016 %>% 
+  mutate(
+    "TOTAL.A" = rowSums(across(c(7:11, 13)))
+    ) %>%
+  dplyr::rename(TOTAL.B = B) %>% 
+  select(c(2:5, 12, 14)) %>%
+  mutate(
+    "TOTAL.POSITIVE" = TOTAL.A + TOTAL.B,
+    "PERCENT.A" = TOTAL.A / TOTAL.SPECIMENS * 100,
+    "PERCENT.B" = TOTAL.B / TOTAL.SPECIMENS * 100,
+    "PERCENT.POSITIVE" = TOTAL.POSITIVE / TOTAL.SPECIMENS * 100,
+    "RATIO.A" = TOTAL.A / (TOTAL.A + TOTAL.B)
+  )
+```
+
+
+```{r Cleaning post 2016 data}
+# generate metrics and removing unnecessary columns in post-2016 data
+public_health_post2016 <- public_health_post2016 %>% 
+  mutate(
+    "TOTAL.A" = rowSums(across(c(6:8, 12))),
+    "TOTAL.B" = rowSums(across(c(9:11)))
+    ) %>% 
+  select(c(2:5, 13:14))
+
+clinical_post2016 <- clinical_post2016 %>%
+  select(c(2:7))
+```
+
+```{r Creating merged post 2016 data}
+# merging the post-2016 data
+merged_post2016 <- merge(clinical_post2016, public_health_post2016, by=c("REGION", "YEAR","WEEK"))
+merged_post2016 <- merged_post2016 %>% 
+  mutate(
+    "TOTAL.SPECIMENS" = rowSums(across(contains("TOTAL.SPECIMENS"))),
+    "TOTAL.A" = rowSums(across(contains("TOTAL.A"))),
+    "TOTAL.B" = rowSums(across(contains("TOTAL.B"))),
+    "TOTAL.POSITIVE" = TOTAL.A + TOTAL.B,
+    "PERCENT.A" = TOTAL.A / TOTAL.SPECIMENS * 100,
+    "PERCENT.B" = TOTAL.B / TOTAL.SPECIMENS * 100,
+    "PERCENT.POSITIVE" = TOTAL.POSITIVE / TOTAL.SPECIMENS * 100,
+    "RATIO.A" = TOTAL.A / (TOTAL.A + TOTAL.B)
+    ) %>% 
+  select(-c(4:9)) %>% 
+  arrange(REGION, YEAR, WEEK)
+```
+
+```{r Merging all data pre and post 2016}
+# merging the pre-2016 and post-2016 data together
+merged_all <- rbind(combined_pre2016, merged_post2016)
+```
+
+```{r}
+# Using lubridate to add accurate dates
+merged_all <- merged_all %>% 
+  mutate(
+    "DATE" = epiweek_to_date(YEAR, WEEK)
+  )
+```
+
+```{r Collapsing regions for national data}
+# Creating a separate dataframe which has HHS regions collapsed into national data
+merged_all_national <- merged_all %>% 
+  select(c(2:6), 12)
+
+merged_all_national <- aggregate(.~DATE+YEAR+WEEK,data=merged_all_national,FUN=sum)
+merged_all_national <- merged_all_national %>% 
+  mutate(
+    "TOTAL.POSITIVE" = TOTAL.A + TOTAL.B,
+    "PERCENT.A" = TOTAL.A / TOTAL.SPECIMENS * 100,
+    "PERCENT.B" = TOTAL.B / TOTAL.SPECIMENS * 100,
+    "PERCENT.POSITIVE" = TOTAL.POSITIVE / TOTAL.SPECIMENS * 100,
+    "RATIO.A" = TOTAL.A / (TOTAL.A + TOTAL.B)
+  )
+
+merged_all_national <- merged_all_national %>% 
+  filter(TOTAL.SPECIMENS != 0)  %>% 
+  mutate(across(c(8:11), ~ replace(., is.nan(.), 0)))
+```
+
+```{r Sample plots}
+past_pandemics <- data.frame(
+  name = c("2009 swine\n flu pandemic", "COVID-19\n lockdowns"),
+  start = c(as_date("2009/4/15"), as_date("2020/03/20")),
+  end = c(as_date("2010/3/12"), as_date("2021/05/28"))
+)
+
+# Plot of national IAV infection rate over time
+merged_all_national %>% 
+  ggplot(aes(x = DATE)) + 
+  geom_rect(
+    aes(NULL, NULL, xmin = start, xmax = end), 
+    ymin = -5, ymax = Inf, data = past_pandemics, color="transparent", fill="gray", alpha=0.3
+  ) +
+  geom_label(
+         aes(x = c(as_date("2009/9/01"), as_date("2020/9/01")), y = 49, label = name),
+         data = past_pandemics,
+         size = 3, vjust = "center", hjust = "center", check_overlap = TRUE
+       ) +
+  geom_line(aes(y = PERCENT.A)) +
+  labs(
+    y = "Specimen Positive with IAV (%)",
+    x = "Year"
+  ) +
+  scale_y_continuous(expand = expansion(c(0, 0), c(1, 3))) +
+  scale_x_date(date_breaks = "1 year", 
+               date_labels = "%Y", 
+               limits = c(as_date("1997/06/01"), as_date("2024/01/01")), 
+               expand = c(0,180)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggsave("infection_total.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+```{r}
+# Plot of national IAV infection rate over time
+merged_all_national %>% 
+  ggplot() + 
+  geom_bar(aes(x = DATE, y = TOTAL.SPECIMENS), stat = "identity") +
+  labs(
+    y = "Specimen Positive with IAV (%)",
+    x = "Year"
+  ) +
+  scale_y_continuous(expand = expansion(c(0, 0), c(1, 3))) +
+  scale_x_date(date_breaks = "1 year", 
+               date_labels = "%Y", 
+               limits = c(as_date("1997/06/01"), as_date("2024/01/01")), 
+               expand = c(0,180)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggsave("infection_total.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+
+```{r}
+hospitalization <- hospitalization %>% 
+  filter(AGE.CATEGORY == 'Overall',
+         SEX.CATEGORY == 'Overall',
+         RACE.CATEGORY == 'Overall')%>% 
+  select(MMWR.YEAR, MMWR.WEEK, AGE.ADJUSTED.WEEKLY.RATE) %>% 
+  dplyr::rename(Year = MMWR.YEAR, 
+         Week = MMWR.WEEK, 
+         Rate = AGE.ADJUSTED.WEEKLY.RATE)
+
+hospitalization <- mutate_all(hospitalization, function(x) as.numeric(as.character(x)))
+
+hospitalization <- hospitalization %>% 
+  mutate(Date = epiweek_to_date(Year, Week))
+```
+
+```{r}
+hos_percent <- hos_percent %>% 
+  select(YEAR, WEEK, INFLUENZA.A) %>% 
+  dplyr::rename(Year = YEAR, 
+         Week = WEEK, 
+         Percent.A = INFLUENZA.A)
+
+hos_percent <- mutate_all(hos_percent, function(x) as.numeric(as.character(x)))
+
+hos_percent <- hos_percent %>% 
+  mutate(Date = epiweek_to_date(Year, Week))
+
+hospitalization <- merge(hospitalization, hos_percent, by = c("Year", "Week", "Date"))
+```
+
+```{r}
+hospitalization <- hospitalization %>% 
+  mutate(Rate.A = Rate * Percent.A / 100)
+```
+
+```{r}
+hos_plot <- data.frame(Date = seq(as.Date("2009-09-05"), as.Date("2024-04-27"), by="weeks"))
+hos_plot <- merge(hos_plot, hospitalization, by = "Date", all.x = TRUE)
+```
+
+
+```{r}
+hos_plot %>% 
+  ggplot(aes(x = Date)) + 
+  geom_line(aes(y = Rate.A), color = "#AA2100") +
+  labs(
+    y = "IAV Hospitalization Rate (per 100,000)",
+    x = "Year"
+  ) +
+  scale_x_date(date_breaks = "1 year", 
+               date_labels = "%Y", 
+               limits = c(as_date("2009/06/01"), as_date("2024/02/01")), 
+               expand = c(0,180)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggsave("hos_total.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+
+
+```{r}
+merged_all_national %>% 
+  ggplot() + 
+  geom_line(aes(x = DATE, y = PERCENT.A)) +
+  labs(
+    y = "Specimen Positive with IAV (%)",
+    x = "Month"
+  ) +
+  scale_x_date(date_breaks = "2 months", 
+               date_labels = " %Y %b", 
+               limits = c(as_date("2022/08/01"), as_date("2023/04/01")),
+               expand = c(0,14)) +
+  ylim(0,50) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        panel.grid.minor = element_blank())
+
+ggsave("infection_2022.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 2, height = 3.9, units = "in")
+
+```
+
+```{r}
+hospitalization %>% 
+  ggplot() + 
+  geom_line(aes(x = Date, y = Rate.A), color = "#AA2100") +
+  labs(
+    y = "IAV Hospitalization Rate (per 100,000)",
+    x = "Month"
+  ) +
+  scale_x_date(date_breaks = "2 months", 
+               date_labels = " %Y %b", 
+               limits = c(as_date("2022/08/01"), as_date("2023/04/01")),
+               expand = c(0,7)) +
+  ylim(0,8.25) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        panel.grid.minor = element_blank())
+
+ggsave("hos_2022.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 2, height = 3.9, units = "in")
+```
+
+
+
+
+---------------------------------------------------------------------------------------------------------------------------------
+Calculating various metrics
+---------------------------------------------------------------------------------------------------------------------------------
+
+```{r}
+# Pivoting the data so each column is years and rows are weeks with values being infection rates
+merged_mem <- merged_all_national %>% 
+  select(c("YEAR", "WEEK", "PERCENT.A")) %>% 
+  pivot_wider(names_from = YEAR, values_from = PERCENT.A) %>% 
+  select(WEEK, sort(names(.)))
+
+merged_mem <- merged_mem %>% 
+  mutate("TEMP" = WEEK < 40)
+```
+
+```{r}
+# Divides and remerges the data together so it starts on epiweek 40
+# This keeps most flu seasons intact rather than divided by year
+merged_mem_split <- split(merged_mem, as.factor(merged_mem$TEMP))
+colnames(merged_mem_split$`TRUE`) <- c("WEEK", "remove", 1997:2022)
+
+merged_mem_40first <- bind_rows(merged_mem_split$`FALSE`, merged_mem_split$`TRUE`)
+
+merged_mem_40first <- merged_mem_40first %>% 
+  column_to_rownames(var = "WEEK")
+
+merged_mem_40first <- merged_mem_40first %>% 
+  select(-tail(names(.), 3)) %>% 
+  
+  # Years which are removed from data
+  select(-c(1:7, "2008", "2009", "2020"))
+```
+```{r}
+merged_mem_40first %>% 
+  select(12:16) %>% 
+  memmodel() %>% 
+  plot()
+```
+
+```{r}
+# Creates a list of mem objects for each year with default 5 years of data
+mem_models <- c()
+for(i in 1:12) {
+  mem_models[[i]] <- merged_mem_40first %>% 
+  select(i:(i+4)) %>% 
+  memmodel()
+}
+
+```
+
+```{r}
+mem_2223 <- merged_all_national %>% 
+  filter(as_date(DATE) >= as_date("2022-10-07"),
+         as_date(DATE) <= as_date("2023-10-01")) %>% 
+  mutate(Period = case_when(YEAR == 2022 & PERCENT.A < 8.03 ~ "Pre-Epidemic",
+                            YEAR == 2023 & PERCENT.A < 8.03 ~ "Post-Epidemic",
+                            PERCENT.A > 8.03 ~ "Epidemic")
+         )
+
+mem_2223 %>% 
+  ggplot(aes(DATE, PERCENT.A)) +
+  geom_line() +
+  geom_point(aes(color = Period), size = 2) +
+  geom_segment(aes(x = as_date("2022-10-08"), y = 8.03, xend = as_date("2022-11-05"), linetype = "Epidemic")) +
+  geom_segment(aes(x = as_date("2022-11-05"), y = 17.1, xend = as_date("2023-01-07"), linetype = "Medium")) +
+  geom_segment(aes(x = as_date("2022-11-05"), y = 34.1, xend = as_date("2023-01-07"), linetype = "High")) +
+  geom_segment(aes(x = as_date("2022-11-05"), y = 46.3, xend = as_date("2023-01-07"), linetype = "Very High")) +
+  scale_linetype_manual(name = "Epidemic Intensity Thresholds", 
+                        values = c(2, 3, 4, 5),
+                        breaks = c("Epidemic", "Medium", "High", "Very High")) +
+  scale_color_manual(name = "Period", 
+                     values = c( "#90e0ef", '#023e8a', '#00b4d8'),
+                     breaks = c("Pre-Epidemic", "Epidemic", "Post-Epidemic")) +
+  scale_x_date(date_breaks = "2 weeks", 
+               date_labels = " %Y - %W",
+               expand = c(0,14)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        panel.grid.minor = element_blank(),
+        legend.justification = c("left", "top"),
+        legend.position = "inside",
+        legend.position.inside = c(0.55, 0.95),
+        legend.background = element_rect(fill = "white", colour = "white")
+        ) +
+  labs(
+    y = "Specimen Positive with IAV (%)",
+    x = "Year - Epidemiological Week"
+  )
+  
+
+ggsave("mem_2022.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+```{r}
+temp <- data.frame(first = c(2010:2019, 2021, 2022),
+           second= c(2011:2020, 2022, 2023))
+
+season <- paste(temp$first, temp$second, sep = "/")
+```
+
+```{r}
+# Counts the length of the flu epidemic each year based on the threshold found from mem
+epidemic_length <- c()
+for(i in 1:12) {
+   temp <- merged_mem_40first %>% 
+    select(all_of(i+4)) >= mem_models[[i]]$epidemic.thresholds[1]
+  epidemic_length[[i]] <- temp %>% as.numeric() %>% sum(na.rm = TRUE)
+}
+
+epidemic_length <- epidemic_length %>% unlist()
+```
+
+
+```{r}
+epidemic_peak <- c()
+for (i in 5:16) {
+  epidemic_peak[i-4] <- merged_mem_40first %>% 
+    select(i) %>%
+    max(na.rm = TRUE)
+}
+```
+
+```{r}
+first_week <- threshold <- med <- high <- vhigh <- list()
+
+for (i in 1:12) {
+  first_week[[i]] <- (which(merged_mem_40first %>% select(i+4) > mem_models[[i]]$epidemic.thresholds[1]) %>% 
+    min() + 39) %% 53
+  threshold[[i]] <- mem_models[[i]]$epidemic.thresholds[1]
+  med[[i]] <- mem_models[[i]]$intensity.thresholds[1]
+  high[[i]] <- mem_models[[i]]$intensity.thresholds[2]
+  vhigh[[i]] <- mem_models[[i]]$intensity.thresholds[3]
+}
+
+mem_thresholds <- cbind(threshold, med, high, vhigh) %>% 
+  as.data.frame() %>% 
+  unnest(cols = c(threshold, med, high, vhigh))
+
+mem_results <- cbind(season, unlist(first_week), epidemic_length, epidemic_peak, mem_thresholds)
+
+mem_results$epidemic_peak <- as.numeric(mem_results$epidemic_peak)
+
+mem_results <- mem_results %>% 
+  mutate(Severity = case_when(epidemic_peak < med ~ "Low",
+                               epidemic_peak > med & epidemic_peak < high ~ "Medium",
+                               epidemic_peak > high & epidemic_peak < vhigh ~ "High",
+                               epidemic_peak > vhigh ~ "Very High"
+                               ))
+mem_results <- mem_results %>% 
+  mutate_if(is.numeric, round, 1)
+
+colnames(mem_results)[1:8] <- c("Season",
+                                "Start week",
+                                "Duration (Weeks)",
+                                "Peak\n(% Positive)",
+                                "Epidemic",
+                                "Medium",
+                                "High",
+                                "Very high"
+)
+```
+
+```{r}
+gt_mem <- gt(mem_results)
+gt_mem <- gt_mem %>% 
+  tab_spanner(
+    label = "Severity Thresholds (% Positive)",
+    columns = c(Epidemic, Medium, High, `Very high`),
+    id = "t"
+  ) %>% 
+  tab_style(style = cell_borders(
+              sides = c("top", "bottom"),
+              weight = px(0)),
+              locations = cells_body()) %>% 
+  tab_style(style = cell_borders(
+              sides = c("top", "bottom"),
+              weight = px(2)),
+              locations = list(cells_column_labels(), cells_stubhead(), cells_column_spanners(spanners = "t"))) %>% 
+  tab_style(style = cell_borders(
+              sides = "bottom",
+              weight = px(2)),
+              locations = cells_body(rows = tidyselect::last_col())) %>% 
+  tab_options(table.width = pct(100),
+              data_row.padding = px(15),
+              table.font.size = px(22),
+              ) %>%
+  cols_align(
+  align = "center",
+  columns = everything()) %>% 
+  cols_width(
+    "Season" ~ px(110),
+    "Duration (Weeks)" ~ px(90),
+    "Start week" ~ px(90),
+    everything() ~ px(100)
+  ) %>% 
+  opt_row_striping(row_striping = TRUE)
+
+gt_mem
+gtsave(gt_mem, filename = "mem.png", path = "/Users/dmsong/Desktop/Senior Thesis")
+```
+
+```{r}
+data.frame(Season = season,
+           `MEM Analysis` = c(3,3,3,2,3,1,2,2,2,1,1,2),
+           CDC = c(2,1,2,2,3,2,2,3,2,2,1,2)
+           ) %>% 
+  pivot_longer(!Season, names_to = "Source", values_to = "Severity") %>% 
+  ggplot(aes(x=Season, y=Severity, fill=Source)) + 
+       geom_bar(stat='identity', position='dodge')
+```
+
+
+
+
+
+```{r}
+max_slope <- function(data, l) {
+  mod.ss <- smooth.spline(data, lambda = l)
+  return(list(mod.ss))
+}
+```
+
+```{r}
+epidemic_ss <- c()
+epidemic_slope <- c()
+
+for (i in 5:16) {
+  temp <- merged_mem_40first %>% 
+    select(i) %>%
+    drop_na()
+  
+  epidemic_ss[i-4] <- max_slope(temp, 0.00001)
+}
+
+for (i in 1:12) {
+  epidemic_slope[i] <- predict(epidemic_ss[[i]], 1:epidemic_ss[[i]]$n, deriv =1)$y %>% max()
+}
+```
+
+```{r}
+slope2223 <- mem_2223 %>% 
+  arrange(DATE) %>% 
+  mutate("Smooth Spline Regression" = epidemic_ss[[12]]$y,
+         "Week-over-Week Change" = predict(epidemic_ss[[12]], 1:epidemic_ss[[12]]$n, deriv =1)$y) 
+```
+
+
+```{r}
+slope2223 %>% 
+  ggplot(aes(x = DATE)) +
+  geom_point(aes(y = PERCENT.A, colour = "Recorded Values"), size = 2)+
+  geom_line(aes(y = `Smooth Spline Regression`, linetype = "Smooth Spline Regression"), linewidth = 0.75, colour = "black") +
+  geom_line(aes(y = `Week-over-Week Change`, linetype = "Week-over-Week Change"), linewidth =0.75, colour = "red") +
+  scale_x_date(date_breaks = "2 weeks", 
+               date_labels = " %Y - %W",
+               expand = c(0,14)) +
+  scale_linetype_manual(name = NULL,
+                        values = c("Smooth Spline Regression" = 1, "Week-over-Week Change" = 4),
+                        breaks = c("Smooth Spline Regression", "Week-over-Week Change")
+                        ) +
+  scale_colour_manual(name = NULL,
+                        values = "darkgray",
+                        breaks = "Recorded Values"
+                        ) +
+  scale_y_continuous(breaks = seq(-10, 30, by = 5)) +
+  labs(
+    y = "Specimen Positive with IAV (%)",
+    x = "Year - Epidemiological Week")+
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        panel.grid.minor = element_blank(),
+        legend.justification = c("left", "top"),
+        legend.position = "inside",
+        legend.position.inside = c(0.5, 0.85),
+        legend.background = element_rect(fill = "white", colour = "white"),
+        legend.spacing.y = unit(-10, "pt"),
+        )
+
+ggsave("slope_2022.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+```{r}
+max_rate <- function(data) {
+  length <- c(1:nrow(data))
+  mod.ss <- smooth.spline(data, lambda = 0.00005)
+  mod.predict <- predict(mod.ss, length, deriv = 1)
+  
+  colors <- c("smooth.spline Regression" = "black", "1st Derivative (Change in Rate)" = "red")
+  
+  mr.plot <- temp %>% 
+  ggplot(aes(x = length, y = data[[1]])) +
+  geom_point() +
+  geom_line(aes(x = mod.ss$x, 
+                y = mod.ss$y,
+                color = "smooth.spline Regression")) +
+  geom_line(linetype = 2,
+            aes(mod.predict$x, 
+                mod.predict$y,
+                color = "1st Derivative (Change in Rate)")) +
+  labs(
+    title = paste(colnames(data), "IAV Infection Rate Over Time and 1st Derivative", sep = " "),
+    x = "Week # (Week 1 = Epiweek 40)",
+    y = "US National IAV Infection Rate",
+    color = "Legend"
+  ) +
+  scale_color_manual(values = colors)
+  
+  print(mr.plot)
+  return(mod.predict$y %>% 
+    max())
+}
+```
+
+---------------------------------------------------------------------------------------------------------------------------------
+Cleaning Hospitalization Rates
+---------------------------------------------------------------------------------------------------------------------------------
+
+
+```{r}
+# Pivoting the data so each column is years and rows are weeks with values being hospitalization rates
+hospitalization_mem <- hospitalization %>%
+  arrange(Year, Week) %>% 
+  select(c("Year", "Week", "Rate")) %>%
+  pivot_wider(names_from = Year, values_from = Rate) %>% 
+  filter(Week != 53)
+
+hospitalization_mem <- hospitalization_mem %>% 
+  mutate("TEMP" = Week < 35)
+
+# Divides and remerges the data together so it starts on epiweek 40
+# This keeps most flu seasons intact rather than divided by year
+hos_mem_split <- split(hospitalization_mem, as.factor(hospitalization_mem$TEMP))
+```
+
+
+```{r}
+colnames(hos_mem_split$`TRUE`) <- c("Week", "remove", 2009:2024)
+
+hos_mem_40first <- bind_rows(hos_mem_split$`FALSE`, hos_mem_split$`TRUE`)
+
+hos_mem_40first <- hos_mem_40first %>% 
+  column_to_rownames(var = "Week")
+
+hos_mem_40first <- hos_mem_40first %>% 
+  select(-tail(names(.), 3), -c("2009", "2020", "2023"))
+
+```
+
+```{r}
+hos_ss <- c()
+hos_slope <- c()
+
+for (i in 1:12) {
+  temp <- hos_mem_40first %>% 
+    select(i) %>%
+    drop_na()
+  
+  hos_ss[i] <- max_slope(temp, 0.00001)
+}
+
+for (i in 1:12) {
+  hos_slope[i] <- predict(hos_ss[[i]], 1:hos_ss[[i]]$n, deriv =1)$y %>% max()
+}
+```
+
+```{r}
+hos_peak <- c()
+for (i in 1:12) {
+  hos_peak[i] <- hos_mem_40first %>% 
+    select(i) %>% 
+    max(na.rm = TRUE)
+}
+```
+
+
+
+```{r}
+metrics <- bind_cols(Season = season, epidemic_length, epidemic_peak, epidemic_slope, hos_peak, hos_slope)
+
+metrics_z <- NULL
+for (i in 2:6) {
+  metrics_z <- bind_cols(metrics_z, tscore(metrics %>% select(i)) %>% unlist())
+}
+
+metrics_avg <- metrics_z %>% 
+  rowSums() /5
+
+metrics_z$Season <- season
+
+colnames(metrics_z) <- c("Duration", 
+                       "Peak Infection Rate", 
+                       "Max Infection Slope",
+                       "Peak Hospitalization Rate",
+                       "Max Hospitalization Slope",
+                       "Season")
+
+metrics <- bind_cols(metrics, metrics_avg)
+
+colnames(metrics) <- c("Season", 
+                       "Duration (Weeks)", 
+                       "Peak Infection (% Positive)", 
+                       "Max Infection Slope",
+                       "Peak Hospitalization (per 100,000)",
+                       "Max Hospitalization Slope",
+                       "Mean T-Score")
+metrics <- metrics %>% 
+  mutate_at(vars(-Season, -`Mean T-Score`), funs(round(., 1))) %>% 
+  mutate_at(vars(`Mean T-Score`), funs(round(., 2)))
+
+gt_metrics <- metrics %>% 
+  select(1:6) %>% 
+  gt() %>% 
+  tab_style(style = cell_borders(
+              sides = c("top", "bottom"),
+              weight = px(0)),
+              locations = cells_body()) %>%
+  tab_style(style = cell_borders(
+              sides = c("top", "bottom"),
+              weight = px(2)),
+              locations = cells_column_labels()) %>% 
+  tab_style(style = cell_borders(
+              sides = "bottom",
+              weight = px(2)),
+              locations = cells_body(rows = tidyselect::last_col())) %>% 
+  tab_options(table.width = pct(100),
+              data_row.padding = px(15),
+              table.font.size = px(22),
+              ) %>%
+  cols_width(
+    "Season" ~ px(75),
+    "Duration (Weeks)" ~ px(70),
+    "Peak Hospitalization (per 100,000)" ~ px(110),
+    everything() ~ px(100)
+  ) %>%
+  cols_align(
+  align = "center",
+  columns = everything()) %>% 
+  opt_row_striping(row_striping = TRUE)
+
+gt_metrics
+gtsave(gt_metrics, filename = "metrics.png", path = "/Users/dmsong/Desktop/Senior Thesis")
+```
+
+```{r}
+compare <- data.frame(Season = metrics$Season,
+                      `Mean T-Score` = metrics$`Mean T-Score`,
+                      `CDC Severity Assessment` = c("Moderate", "Low", "Moderate", "Moderate", "High", "Moderate", "Moderate", "High", "Moderate", "Moderate", "Low", "Moderate"))
+
+colnames(compare) <- c("Season", 
+                       "Mean T-Score", 
+                       "CDC Severity Assessment")
+
+gt_compare <- compare %>% 
+  gt() %>% 
+  tab_style(style = cell_borders(
+              sides = c("top", "bottom"),
+              weight = px(0)),
+              locations = cells_body()) %>%
+  tab_style(style = cell_borders(
+              sides = c("top", "bottom"),
+              weight = px(2)),
+              locations = cells_column_labels()) %>% 
+  tab_style(style = cell_borders(
+              sides = "bottom",
+              weight = px(2)),
+              locations = cells_body(rows = tidyselect::last_col())) %>% 
+  tab_options(table.width = pct(60),
+              data_row.padding = px(15),
+              table.font.size = px(22),
+              ) %>%
+  cols_width(
+    "Season" ~ px(60),
+    "Mean T-Score" ~ px(60),
+    everything() ~ px(75)
+  ) %>%
+  cols_align(
+  align = "center",
+  columns = everything()) %>% 
+  opt_row_striping(row_striping = TRUE) %>%   
+  tab_footnote(
+    footnote = "Source: CDC Past Seasons’ Flu Season Severity Assessments",
+    locations = cells_column_labels(columns = `CDC Severity Assessment`)
+  )
+
+gt_compare
+gtsave(gt_compare, filename = "compare.png", path = "/Users/dmsong/Desktop/Senior Thesis")
+```
+
+
+```{r}
+metrics %>% 
+  ggplot(aes(sample = `Peak Infection (% Positive)`)) +
+  geom_qq(color = "cornflowerblue", size = 2) +
+  geom_qq_line() +
+  theme_classic() +
+  labs(x = "Theoretical Quantiles",
+       y = "Peak Infection (% Positive)")
+ggsave("qq1.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 3, height = 3, units = "in")
+
+metrics %>% 
+  ggplot(aes(sample = `Duration (Weeks)`)) +
+  geom_qq(color = "cornflowerblue", size = 2X) +
+  geom_qq_line() +
+  theme_classic() +
+  labs(x = "Theoretical Quantiles",
+       y = "Duration (Weeks)")
+
+ggsave("qq2.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 3, height = 3, units = "in")
+```
+
+
+```{r}
+metrics_z_long <- metrics_z %>% pivot_longer(!Season, names_to = "Metric", values_to = "T-Score") %>% 
+  mutate(Layer = case_when(Metric == "Duration" ~ 3, 
+                           Metric == "Peak Infection Rate" ~ 1, 
+                           Metric == "Max Infection Slope" ~ 2 ,
+                           Metric == "Peak Hospitalization Rate" ~ 4,
+                           Metric == "Max Hospitalization Slope" ~ 5),
+         Color = case_when(`T-Score` < 0 ~ "red",
+                           `T-Score` > 0 ~ "green"))
+
+
+metrics_z_long$Metric <- reorder(metrics_z_long$Metric, metrics_z_long$Layer)
+
+metrics_z_long %>% 
+  ggplot() +
+  geom_bar(stat ='identity', aes(x = Season, y = `T-Score`, fill = Color)) +
+  geom_hline(aes(yintercept=2.201, linetype = "p = 0.05"), alpha = 0.4) +
+  geom_hline(aes(yintercept=-2.201, linetype = "p = 0.05"), alpha = 0.4) +
+  geom_hline(aes(yintercept=4.437, linetype = "p = 0.001"), alpha = 0.4) +
+  geom_hline(aes(yintercept=-4.437, linetype = "p = 0.001"), alpha = 0.4) +
+  facet_wrap(~ Metric,
+             ncol = 3,
+             axes = "all_x") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+        legend.position = c(.8, .15)) +
+  scale_fill_manual(values = c("#228B22", "#B22222"),
+                    guide = "none") +
+  scale_linetype_manual(name = "P-Value Threshold", 
+                        values = c(1, 2),
+                        breaks = c("p = 0.05", "p = 0.001"))
+  
+
+ggsave("zscores.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 8, height = 6, units = "in")
+```
+
+```{r}
+lm <- lm(c(4,2,4,4,6,4,4,6,4,4,2,4) ~ `Duration (Weeks)` + 
+                       `Peak Infection (% Positive)` + 
+                       `Max Infection Slope` +
+                       `Peak Hospitalization (per 100,000)` +
+                       `Max Hospitalization Slope`, data=metrics)
+
+anova(lm)
+
+  metrics %>% select(3) %>% unlist() %>% qqnorm(pch = 1, frame = FALSE)
+  metrics %>% select(3) %>% unlist() %>% qqline(col = "steelblue", lwd = 2)
+
+```
+
+
+
+```{r}
+x <- metrics %>% select(2) %>% tscore()
+```
+
+```{r}
+cor(a$PERCENT.A, a$Rate.A, use = "complete.obs")
+
+fa <- factanal(x = metrics_z[1:5], factors = 2, rotation = "promax", scores = "regression")
+cor(fa$scores)
+```
+
+```{r}
+loadings <- data.frame(x = fa$loadings %>% as.numeric() %>% head(5),
+           y = fa$loadings %>% as.numeric() %>% tail(5)
+)
+
+loadings <- loadings %>% 
+  mutate(label = c("Duration", 
+                       "Peak Infection Rate", 
+                       "Max Infection Slope",
+                       "Peak Hospitalization Rate",
+                       "Max Hospitalization Slope"))
+  
+
+loadings %>% 
+  ggplot(aes(x = x, y= y, label = label)) +
+  geom_hline(aes(yintercept = 0), alpha = 0.2) +
+  geom_vline(aes(xintercept = 0), alpha = 0.2) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(direction = "both", force_pull = 0) +
+  ylim(-0.2, 1.1) +
+  xlim(-0.2, 1.1) +
+  theme_classic() + 
+  theme(panel.grid = element_blank()) +
+  labs(x = "Factor 1 (Transmissibility)",
+       y = "Factor 2 (Virulence)")
+
+ggsave("efa.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+
+```{r}
+p.mat <- cor_pmat(metrics_z %>% select(1:5))
+
+
+cor(metrics_z %>% select(1:5)) %>% 
+  ggcorrplot(outline.col = "white", 
+             method = "circle",
+             p.mat = p.mat,lab = TRUE) +
+  scale_fill_gradient2(low = "white", high = "red", breaks=c(0, 1), limit=c(0, 1))+ 
+  labs(fill = "Pearson\nCorrelation\nCoefficient")
+
+ggsave("cor.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 4, units = "in")
+```

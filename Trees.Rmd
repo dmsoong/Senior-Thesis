@@ -1,0 +1,331 @@
+---
+title: "Phylo Trees"
+author: "David Song"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(mem)
+library(npreg)
+library(gridExtra)
+library(seqinr)
+library(ape)
+library(msa)
+library(treeio)
+library(ggtree)
+library(phylotools)
+library(Biostrings)
+library(tracerer)
+library(rstatix)
+```
+
+```{r}
+for (i in 1:length(h1n1_proteins)) {
+file_location <- paste0("/Users/dmsong/Library/CloudStorage/GoogleDrive-dmsong@princeton.edu/My Drive/Flu Genomes/", h1n1_proteins[[i]], ".fa")
+
+fasta <- readAAStringSet(file_location)
+fasta <- fasta %>% 
+  chartr(old = "J", new = "X") %>% 
+  chartr(old = "B", new = "X") %>% 
+  chartr(old = "Z", new = "X")
+
+writeXStringSet(fasta, file_location)
+
+for (i in 1:length(h3n2_proteins)) {
+file_location <- paste0("/Users/dmsong/Library/CloudStorage/GoogleDrive-dmsong@princeton.edu/My Drive/Flu Genomes/", h3n2_proteins[[i]], ".fa")
+
+fasta <- readAAStringSet(file_location)
+fasta <- fasta %>% 
+  chartr(old = "J", new = "X") %>% 
+  chartr(old = "B", new = "X") %>% 
+  chartr(old = "Z", new = "X")
+
+writeXStringSet(fasta, file_location)
+}
+}
+```
+
+```{r}
+h1n1_proteins <- c(
+  "ha_h1n1",
+  "m1_h1n1",
+  "m2_h1n1",
+  "na_h1n1",
+  "np_h1n1",
+  "ns1_h1n1",
+  "ns2_h1n1",
+  "pa_h1n1",
+  "pa-x_h1n1",
+  "pb1_h1n1",
+  "pb2_h1n1"
+)
+
+```
+
+```{r}
+h3n2_proteins <- c(
+  "ha_h3n2",
+  "m1_h3n2",
+  "m2_h3n2",
+  "na_h3n2",
+  "np_h3n2",
+  "ns1_h3n2",
+  "ns2_h3n2",
+  "pa_h3n2",
+  "pa-x_h3n2",
+  "pb1_h3n2",
+  "pb1-f2_h3n2",
+  "pb2_h3n2"
+)
+
+
+```
+
+```{r}
+week40 <- c()
+week40 <- merged_all_national %>% 
+  group_by(DATE) %>% 
+  filter(WEEK ==40 & YEAR %in% c(2010:2023)) %>% 
+  select(DATE) %>% 
+  as.vector()
+
+week40 <- week40$DATE
+
+week40
+```
+
+```{r Add Season to Tree}
+add_season <- function(tree) {
+  tree <- tree %>% 
+  mutate(date = str_split_i(tree$label, "_", 1) %>% as_date())
+
+  tree <- tree %>% 
+  mutate(Season = case_when(
+                  date < week40[[1]] ~ "2009/2010",
+                  date < week40[[2]] ~ season[[1]],
+                  date < week40[[3]] ~ season[[2]],
+                  date < week40[[4]] ~ season[[3]],
+                  date < week40[[5]] ~ season[[4]],
+                  date < week40[[6]] ~ season[[5]],
+                  date < week40[[7]] ~ season[[6]],
+                  date < week40[[8]] ~ season[[7]],
+                  date < week40[[9]] ~ season[[8]],
+                  date < week40[[10]] ~ season[[9]],
+                  date < week40[[11]] ~ season[[10]],
+                  date < week40[[12]] ~ "2020/2021",
+                  date < week40[[13]] ~ season[[11]],
+                  date < week40[[14]] ~ season[[12]],
+  )
+           )
+  return(tree)
+} 
+
+```
+
+```{r}
+remove_outliers <- function(tree) {
+  extreme <- tree %>% 
+  group_by(Season) %>% 
+  identify_outliers(branch.length) %>% 
+  filter(is.extreme == TRUE)
+
+  tree <- anti_join(tree, extreme, by = "label")
+
+  tree %>% 
+  group_by(Season) %>%
+  summarise_at(vars("branch.length"), mean)
+
+}
+```
+
+```{r}
+# mega chungus loop for reading in all the proteins
+proteins <- c(h1n1_proteins, h3n2_proteins)
+bl_all <- NULL
+bl_list <- c()
+
+for (i in 1: 23) {
+  file = paste0("tree/", proteins[[i]], "_tree")
+  if(!file.exists(file)) {
+     next
+  }
+  
+  tree <- read.beast(file) %>% 
+    as_tibble() %>% 
+    add_season()
+  
+  if (file != "tree/m1_h3n2_tree") {
+    bl_all <- bind_rows(bl_all, tree %>% filter(date > as_date("2009/10/01")))
+  }
+  
+  tree <- remove_outliers(tree)
+  names(tree)[2] <- proteins[[i]]
+  
+  
+  bl_list[[i]] <- tree
+}
+```
+
+```{r}
+bl_protein <- data.frame(Season = season)
+
+for (i in 1:23) {
+  if(is.null(bl_list[[i]])) {
+    next
+  }
+  
+  bl_protein <- left_join(bl_protein, bl_list[[i]], by = join_by(Season))
+}
+
+```
+
+```{r}
+bl_protein_long <- bl_protein %>% 
+  pivot_longer(!Season, names_to = "Protein", values_to = "Length")
+```
+
+
+```{r}
+bl_all <- bl_all %>% 
+  mutate(log = log10(branch.length))
+```
+
+```{r}
+gghistogram(bl_all, x = "log", rug = TRUE, binwidth = 0.15, ylab = "Count", xlab = "Log(Branch Length)", fill = "lightgray", add = "median")
+
+ggsave("longbranch.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+
+```{r}
+size <- c()
+
+for (i in 1:23) {
+  file = paste0("fasta/", proteins[[i]], ".fa")
+  if(!file.exists(file)) {
+     next
+  } 
+  size[[i]] <- read.fasta(file) %>% 
+    nrow()
+}
+```
+
+```{r}
+cr_list <- c()
+for (i in 1:23) {
+  file = paste0("log/", proteins[[i]], ".log")
+  if(!file.exists(file)) {
+     next
+  } else{
+  trace <- parse_beast_tracelog_file(file) %>% 
+    remove_burn_ins(burn_in_fraction = 0.1)
+      
+  clock <- calc_summary_stats(trace$clockRate, sample_interval = 1000) %>% 
+    select(-"mode") %>% 
+    mutate(Protein = toupper(str_split_i(proteins[[i]], "_", 1)),
+         Subtype = toupper(str_split_i(proteins[[i]], "_", 2)),
+         Size = size[[i]])
+  
+  cr_list[[i]] <- clock
+  }
+}
+
+clockrate <- cr_list[[1]]
+for (i in 2:23) {
+  clockrate <- bind_rows(clockrate, cr_list[[i]])
+}
+```
+
+```{r}
+bl_cor <- c()
+bl_name <- c()
+for (i in 1:23) {
+  bl_cor[[i]] <- cor(metrics$`Mean T-Score`, bl_protein %>% select(i+1), use = "complete.obs")
+  bl_name[[i]] <- bl_protein %>% select(i+1) %>% colnames()
+}
+```
+
+```{r}
+bl_compiled <- data.frame(Name = unlist(bl_name),
+                   Correlation = unlist(bl_cor))
+
+bl_compiled <- bl_compiled %>% 
+  mutate(Protein = toupper(str_split_i(Name, "_", 1)),
+         Subtype = toupper(str_split_i(Name, "_", 2)))
+bl_compiled %>% 
+  ggplot(aes(x=Protein, y=Correlation, fill = Subtype)) + 
+  geom_col(width = 0.6, position = position_dodge(0.8)) +
+  theme_classic()
+
+ggsave("bl_cor.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+
+```{r}
+x <- bl_compiled %>% 
+  filter(Subtype == "H1N1") %>% 
+  select(Correlation) %>% 
+  unlist()
+
+y <- bl_compiled %>% 
+  filter(Subtype == "H3N2") %>% 
+  select(Correlation) %>% 
+  unlist()
+
+t.test(x, y, alternative = "two.sided", var.equal = FALSE)
+```
+
+```{r}
+library(ggpubr)
+ggboxplot(bl_compiled, x = "Subtype", 
+          y = "Correlation",
+          fill = "lightgray",
+          ylab = "Pearson Correlation Coefficient", 
+          add = "dotplot",
+          add.params = list(size = 0.75)) +
+  ylim(-0.5, 1.3) +
+  geom_bracket(
+    xmin = "H1N1", xmax = "H3N2", y.position = 1.2,
+    label = "ns", tip.length = c(0.1, 0.45)
+  )
+
+ggsave("subtype_compare.png", plot = last_plot(), path = "/Users/dmsong/Desktop/Senior Thesis", width = 6, height = 3.9, units = "in")
+```
+```{r}
+clockrate %>% 
+  ggdotchart(x = "Protein", y = "mean")
+```
+
+
+```{r}
+clockrate %>%
+  arrange(mean) %>% 
+  ggplot(aes(x=Protein, y=mean, color = Subtype)) + 
+  geom_point() + 
+  geom_errorbar(aes(ymin=mean-stdev, ymax=mean+stdev), width=.3) +
+  geom_segment() +
+  labs(
+    y = "Mean Clock Rate (subsitutions/site/year)"
+  ) +
+  theme_classic() +
+  scale_x_discrete(limits = c("HA", "NA", "PB1", "PB2", "PA", "NP", "M1", "M2", "NS1", "NS2", "PA-X", "PB1-F2")) +
+  scale_color_manual(values = c("#1565c0", "#ffca28"))
+
+```
+
+
+
+```{r}
+for (i in 1: 23) {
+  file = paste0("tree/", proteins[[i]], "_tree")
+
+  
+  tree <- read.beast(file)
+  print <- ggtree(tree, mrsd="2023-10-01") + theme_tree2() + labs(title = file)
+  print(print)
+}
+
+
+```
+
